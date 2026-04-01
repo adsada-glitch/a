@@ -1,0 +1,258 @@
+import os
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict, Any
+
+import torch
+from PIL import Image
+from torchvision import models, transforms
+
+
+@dataclass
+class YoloDetection:
+    """单个 YOLO 检测结果."""
+
+    bbox: Tuple[int, int, int, int]  # (x1, y1, x2, y2)
+    score: float
+    cls_id: int
+    cls_name: str
+
+
+class YoloV11Detector:
+    """
+    YOLOv11 一阶段检测封装（第一层：粗粒度检测）.
+
+    这里只实现通用接口，真正加载模型时你可以：
+    - 使用 `ultralytics` 官方 YOLO 系列；
+    - 或者加载你自己训练好的 YOLOv11 权重。
+    """
+
+    def __init__(self, model_path: str, device: Optional[str] = None, conf_threshold: float = 0.25):
+        self.model_path = model_path
+        self.conf_threshold = conf_threshold
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+        # 懒加载：只有真正推理时才去加载第三方依赖
+        self._model = None
+
+    def _lazy_load(self) -> None:
+        if self._model is not None:
+            return
+
+        try:
+            from ultralytics import YOLO  # type: ignore
+        except ImportError as e:
+            raise RuntimeError(
+                "需要安装 `ultralytics` 库才能运行 YOLOv11 检测，例如：\n"
+                "    pip install ultralytics\n"
+                "然后将你训练好的 YOLOv11 权重路径传给 `YoloV11Detector(model_path=...)`。"
+            ) from e
+
+        self._model = YOLO(self.model_path)
+        self._model.to(self.device)
+
+    def predict(self, image: Image.Image) -> List[YoloDetection]:
+        """
+        对整幅图像做目标检测，返回疑似缺陷区域（边界框列表）.
+        对应流程图中的：YOLOv11 粗粒度检测（核心目标：快速定位可疑区域，过滤 90% 正常区域）
+        """
+        self._lazy_load()
+        assert self._model is not None
+
+        results = self._model(image, conf=self.conf_threshold, verbose=False)[0]
+        detections: List[YoloDetection] = []
+
+        names = results.names
+        for box in results.boxes:
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            score = float(box.conf[0].item())
+            cls_id = int(box.cls[0].item())
+            cls_name = names.get(cls_id, str(cls_id))
+
+            detections.append(
+                YoloDetection(
+                    bbox=(int(x1), int(y1), int(x2), int(y2)),
+                    score=score,
+                    cls_id=cls_id,
+                    cls_name=cls_name,
+                )
+            )
+
+        return detections
+
+
+class ResNet50DefectClassifier:
+    """
+    ResNet50 第二层精细检测 / 分类.
+
+    - 输入：第一层输出的可疑区域 ROI（裁剪后的图像 patch）
+    - 输出：缺陷类别 + 置信度
+    """
+
+    def __init__(
+        self,
+        num_classes: int,
+        checkpoint_path: Optional[str] = None,
+        device: Optional[str] = None,
+        confidence_threshold: float = 0.95,
+    ):
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.confidence_threshold = confidence_threshold
+
+        # 加载 Imagenet 预训练权重，再根据你自己的类别数进行微调
+        weights = models.ResNet50_Weights.IMAGENET1K_V2
+        self.model = models.resnet50(weights=weights)
+
+        if num_classes != 1000:
+            in_features = self.model.fc.in_features
+            self.model.fc = torch.nn.Linear(in_features, num_classes)
+
+        if checkpoint_path and os.path.exists(checkpoint_path):
+            state_dict = torch.load(checkpoint_path, map_location="cpu")
+            self.model.load_state_dict(state_dict)
+
+        self.model.to(self.device)
+        self.model.eval()
+
+        # 与工业视觉常用配置类似的预处理
+        self.transform = transforms.Compose(
+            [
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225],
+                ),
+            ]
+        )
+
+    @torch.no_grad()
+    def predict_patch(self, patch: Image.Image) -> Tuple[int, float]:
+        """
+        对单个 ROI 进行精细检测.
+        返回：(预测类别 ID, 置信度)
+        """
+        tensor = self.transform(patch).unsqueeze(0).to(self.device)
+        logits = self.model(tensor)
+        probs = torch.softmax(logits, dim=1)
+        score, cls_id = torch.max(probs, dim=1)
+        return int(cls_id.item()), float(score.item())
+
+
+class DualStageInspectionPipeline:
+    """
+    按照流程图实现的“双层检测流程”：
+
+    1. 图像输入 -> YOLOv11 粗粒度检测（过滤 90% 正常区域，只保留 3~5 个可疑区域）
+    2. ROI 裁剪 -> ResNet50 精细检测
+    3. 根据置信度与位置触发：
+       - 实时报警（置信度/置信度+位置阈值）
+       - 报警报告 / 趋势分析（数据回传到上层系统）
+    """
+
+    def __init__(
+        self,
+        yolo_detector: YoloV11Detector,
+        resnet_classifier: ResNet50DefectClassifier,
+        max_rois_per_image: int = 5,
+    ):
+        self.yolo_detector = yolo_detector
+        self.resnet_classifier = resnet_classifier
+        self.max_rois_per_image = max_rois_per_image
+
+    def _crop_roi(self, image: Image.Image, bbox: Tuple[int, int, int, int]) -> Image.Image:
+        x1, y1, x2, y2 = bbox
+        return image.crop((x1, y1, x2, y2))
+
+    def inspect_image(self, image: Image.Image) -> Dict[str, Any]:
+        """
+        对单张图像执行两阶段检测，返回结构化结果，方便后续接 SaaS 平台 / 报警系统。
+        """
+        # 第一阶段：YOLOv11 检测可疑区域
+        detections = self.yolo_detector.predict(image)
+
+        # 只保留置信度最高的若干个区域（对应“每片 3~5 个区域，占比 10%”）
+        detections = sorted(detections, key=lambda d: d.score, reverse=True)[
+            : self.max_rois_per_image
+        ]
+
+        second_stage_results = []
+        alarms = []
+
+        for det in detections:
+            roi = self._crop_roi(image, det.bbox)
+            cls_id, cls_conf = self.resnet_classifier.predict_patch(roi)
+
+            result = {
+                "yolo_bbox": det.bbox,
+                "yolo_score": det.score,
+                "yolo_cls_id": det.cls_id,
+                "yolo_cls_name": det.cls_name,
+                "resnet_cls_id": cls_id,
+                "resnet_conf": cls_conf,
+            }
+            second_stage_results.append(result)
+
+            # 简单示例规则：
+            # - ResNet50 置信度 >= 0.95 视为“确定缺陷”，触发实时报警
+            if cls_conf >= self.resnet_classifier.confidence_threshold:
+                alarms.append(
+                    {
+                        "type": "realtime_alarm",
+                        "message": "检测到高置信度缺陷",
+                        "bbox": det.bbox,
+                        "cls_id": cls_id,
+                        "confidence": cls_conf,
+                    }
+                )
+
+        return {
+            "raw_yolo_detections": [det.__dict__ for det in detections],
+            "second_stage_results": second_stage_results,
+            "alarms": alarms,
+        }
+
+
+def load_image(path: str) -> Image.Image:
+    return Image.open(path).convert("RGB")
+
+
+def demo():
+    """
+    一个简单 demo：展示如何按流程图跑通整套双层检测流程。
+    你只需要修改：
+    - `yolo_weights_path` 为你自己的 YOLOv11 权重
+    - `resnet_checkpoint_path` 为你自己训练好的 ResNet50 权重（可选）
+    - `image_dir` 为你的测试图片目录
+    """
+    # ===== 路径配置（需要你自行修改） =====
+    yolo_weights_path = "path/to/your/yolov11.pt"
+    resnet_checkpoint_path = None  # 如果已经 finetune 了 ResNet50，就填权重路径
+    image_dir = "samples"
+
+    # ===== 模型构建 =====
+    yolo = YoloV11Detector(model_path=yolo_weights_path, conf_threshold=0.25)
+    # 假设缺陷类别数为 2（正常 / 缺陷），你可以根据实际标签数调整
+    resnet = ResNet50DefectClassifier(num_classes=2, checkpoint_path=resnet_checkpoint_path)
+    pipeline = DualStageInspectionPipeline(yolo_detector=yolo, resnet_classifier=resnet)
+
+    # ===== 按照流程图逐张图片处理 =====
+    for filename in os.listdir(image_dir):
+        if not filename.lower().endswith((".jpg", ".jpeg", ".png", ".bmp")):
+            continue
+
+        img_path = os.path.join(image_dir, filename)
+        image = load_image(img_path)
+        result = pipeline.inspect_image(image)
+
+        print(f"图片: {filename}")
+        print("  YOLOv11 第一阶段检测数:", len(result["raw_yolo_detections"]))
+        print("  第二阶段 ResNet50 检测结果数:", len(result["second_stage_results"]))
+        print("  触发报警数:", len(result["alarms"]))
+        for alarm in result["alarms"]:
+            print("    ->", alarm)
+
+
+if __name__ == "__main__":
+    demo()
+
+
