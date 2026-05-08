@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <title>星际生存战</title>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <div id="app">
+    <canvas id="game" aria-label="游戏画布"></canvas>
+    <div id="hud">
+      <div class="hud-panel hud-top">
+        <div class="hud-bracket"></div>
+        <div class="hud-inner">
+          <div class="hud-row">
+            <span><span class="label">SCORE</span> <span id="score" class="value mono">0</span></span>
+            <span><span class="label">BEST</span> <span id="best" class="value mono">0</span></span>
+          </div>
+          <div class="hud-row">
+            <span><span class="label">LIVES</span> <span id="lives" class="value mono">3</span></span>
+            <span><span class="label">WAVE</span> <span id="wave" class="value mono">1</span></span>
+          </div>
+          <div class="hud-row">
+            <span><span class="label">LV</span> <span id="level" class="value mono">-</span></span>
+            <span class="xp-wrap">
+              <span class="label">XP</span>
+              <span class="xp-track"><span id="xp-fill" class="xp-fill"></span></span>
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div id="skill-overlay" class="skill-overlay hidden" aria-hidden="true">
+      <div class="skill-card-wrap">
+        <h2 id="skill-title" class="skill-title mono">升级</h2>
+        <div class="skill-buttons">
+          <button type="button" class="skill-btn mono" data-skill="" data-idx="0"></button>
+          <button type="button" class="skill-btn mono" data-skill="" data-idx="1"></button>
+          <button type="button" class="skill-btn mono" data-skill="" data-idx="2"></button>
+        </div>
+      </div>
+    </div>
+    <div id="overlay" class="overlay">
+      <div class="overlay-card">
+        <h1 class="title mono">星际生存战</h1>
+        <p id="overlay-msg" class="msg mono">点击下方按钮或按空格开始</p>
+        <p class="hint mono">拖动飞船移动，自动射击；吃经验升级；每升 3 级三选一技能；坚持越久越难，击败 Boss 得高分。</p>
+        <button type="button" id="btn-start" class="btn-start mono">开始</button>
+      </div>
+    </div>
+  </div>
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
